@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import shutil
 
 def process_args(args: dict) -> tuple[list[str], Path]:
     path = Path("runtime_store/config.toml")
@@ -15,6 +15,7 @@ def process_args(args: dict) -> tuple[list[str], Path]:
             to_print = f"{key} = {value}"
             output_args.append(to_print)
             f.write(to_print + "\n")
+    shutil.copy(path, "../last_config.toml")
     return output_args, path
 
 
@@ -47,4 +48,5 @@ def process_dataset_args(args: dict) -> tuple[dict, Path]:
                 to_print = f"{key} = {value}"
                 output_args["subsets"][-1].append(to_print)
                 f.write(f"\t{to_print}\n")
+    shutil.copy(path, "../last_dataset_config.toml")
     return output_args, path

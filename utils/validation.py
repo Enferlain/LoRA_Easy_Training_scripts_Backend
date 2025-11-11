@@ -7,14 +7,14 @@ import math
 from LoraEasyCustomOptimizer import OPTIMIZERS
 
 
-def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
+def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict, dict]:
     over_errors = []
     if "args" not in args:
         over_errors.append("args is not present")
     if "dataset" not in args:
         over_errors.append("dataset is not present")
     if over_errors:
-        return False, False, over_errors, {}, {}
+        return False, False, over_errors, {}, {}, {}
     args_pass, args_errors, args_data = validate_args(args["args"])
     dataset_pass, dataset_errors, dataset_data = validate_dataset_args(args["dataset"])
     over_pass = args_pass and dataset_pass
@@ -84,6 +84,8 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
             passed_validation = False
             errors.append(f"No data filled in for {key}")
             continue
+        if not isinstance(value, dict):
+            continue
         if "fa" in value and value["fa"]:
             output_args["network_module"] = "networks.lora_fa"
             del value["fa"]
@@ -112,15 +114,17 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
                     vals.append(f"{k}={v}")
                 val = vals
             if arg == "optimizer_args":
-                vals = []
-                for k, v in val.items():
-                    if isinstance(v, str) and v.strip().lower() in ["true", "false"]:
-                        v = v.strip().capitalize()
-                    vals.append(f"{k}={v}")
-                val = vals
+                if isinstance(val, dict):
+                    vals = []
+                    for k, v in val.items():
+                        if isinstance(v, str) and v.strip().lower() in ["true", "false"]:
+                            v = v.strip().capitalize()
+                        vals.append(f"{k}={v}")
+                    val = vals
             if arg == "lr_scheduler_args":
-                vals = [f"{k}={v}" for k, v in val.items()]
-                val = vals
+                if isinstance(val, dict):
+                    vals = [f"{k}={v}" for k, v in val.items()]
+                    val = vals
             if arg == "keep_tokens_separator" and len(val) < 1:
                 passed_validation = False
                 errors.append("Keep Tokens Separator is an empty string")
@@ -130,10 +134,19 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
                 (isinstance(value, bool) and value == False)):
                 continue
             if isinstance(val, str):
-                if val.strip().lower() == "true":
+                val_stripped = val.strip()
+                if val_stripped.lower() == "true":
                     val = True
-                elif val.strip().lower() == "false":
+                elif val_stripped.lower() == "false":
                     continue
+                else:
+                    try:
+                        val = int(val_stripped)
+                    except ValueError:
+                        try:
+                            val = float(val_stripped)
+                        except ValueError:
+                            pass  # Not a number, keep as string
             output_args[arg] = val
         if "fa" in value:
             del value["fa"]
@@ -181,6 +194,8 @@ def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
             continue
         if key == "subsets":
             continue
+        if not isinstance(value, dict):
+            continue
         for arg, val in value.items():
             if (val is None or 
                 (isinstance(val, str) and val.strip() == '') or 
@@ -211,16 +226,18 @@ def validate_subset(args: dict) -> tuple[bool, list[str], dict]:
          }
     name = "subset"
     if "name" in output_args:
-        name = output_args["name"]
+        name = str(output_args["name"])
         del output_args["name"]
-    if "image_dir" not in output_args or not Path(output_args["image_dir"]).exists():
+    image_dir = output_args.get("image_dir")
+    if not image_dir or not isinstance(image_dir, str) or not Path(image_dir).exists():
         passed_validation = False
         errors.append(f"Image directory path for '{name}' does not exist")
     else:
-        output_args["image_dir"] = Path(output_args["image_dir"]).as_posix()
-        
-    if "target_image_dir" in output_args and Path(output_args["target_image_dir"]).exists():
-        output_args["target_image_dir"] = Path(output_args["target_image_dir"]).as_posix()
+        output_args["image_dir"] = Path(image_dir).as_posix()
+
+    target_image_dir = output_args.get("target_image_dir")
+    if target_image_dir and isinstance(target_image_dir, str) and Path(target_image_dir).exists():
+        output_args["target_image_dir"] = Path(target_image_dir).as_posix()
 
     return passed_validation, errors, output_args
 
@@ -293,7 +310,7 @@ def validate_save_tags(dataset: dict) -> dict:
                 continue
             if file.suffix != subset["caption_extension"]:
                 continue
-            get_tags_from_file(subset_dir.joinpath(file.name), tags)
+            get_tags_from_file(str(subset_dir.joinpath(file.name)), tags)
     return dict(sorted(tags.items(), key=lambda item: item[1], reverse=True))
 
 
@@ -325,7 +342,9 @@ def calculate_steps(
     num_epochs: int,
     grad_acc_steps: int = 1,
 ) -> int:
+    assert isinstance(dataset_args.get("general"), dict)
     general_args: dict = dataset_args["general"]
+    assert isinstance(dataset_args.get("subsets"), list)
     subsets: list = dataset_args["subsets"]
     supported_types = [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
     resolution = (
