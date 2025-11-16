@@ -6,7 +6,7 @@ from LoraEasyCustomOptimizer.adabelief import AdaBelief
 from LoraEasyCustomOptimizer.adagc import AdaGC
 from LoraEasyCustomOptimizer.adammini import AdamMini
 from LoraEasyCustomOptimizer.adan import Adan
-from LoraEasyCustomOptimizer.ademamix import (AdEMAMix, SimplifiedAdEMAMix, SimplifiedAdEMAMixExM)
+from LoraEasyCustomOptimizer.ademamix import (AdEMAMix, SimplifiedAdEMAMix, SimplifiedAdEMAMixExM, SimplifiedAdEMAMixExM_RamTorch)
 from LoraEasyCustomOptimizer.adopt import ADOPT
 from LoraEasyCustomOptimizer.came import CAME
 from LoraEasyCustomOptimizer.compass import Compass, Compass8BitBNB, CompassPlus, CompassADOPT, CompassADOPTMARS, CompassAO
@@ -124,6 +124,7 @@ OPTIMIZER_LIST: List[OPTIMIZER] = [
     Simplified_AdEMAMix_adv,
     SimplifiedAdEMAMix,
     SimplifiedAdEMAMixExM,
+    SimplifiedAdEMAMixExM_RamTorch,
     SingState,
     SNOO_ASGD,
     StableSPAM,

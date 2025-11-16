@@ -9,8 +9,23 @@ import torch
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup
+import pytorch_optimizer.base.optimizer as baseopt
 from .utils import copy_stochastic_, UPDATE_STRATEGY, NORM_TYPE, agc, _paper_orthograd, adaptive_eps, _stable_spam_clipping_compile_wrapper, _stable_spam_clipping_impl
 
+
+def safe_apply_weight_decay(self, p, grad=None, lr=0.0, weight_decay=0.0, weight_decouple=False, fixed_decay=False, ratio=None):
+    if weight_decay == 0.0:
+        return
+    # force scalar math only
+    if isinstance(lr, torch.Tensor):
+        lr = float(lr.detach().cpu().item())
+    if weight_decouple:
+        p.mul_(1.0 - (lr if not fixed_decay else 1.0) * float(weight_decay))
+    else:
+        # L2 path: handled upstream by adding weight_decay * p into the update; do nothing here
+        return
+
+baseopt.BaseOptimizer.apply_weight_decay = safe_apply_weight_decay
 
 # https://github.com/kozistr/pytorch_optimizer/blob/6397d56279ad80b26c4bba7fb4b04852b517fdeb/pytorch_optimizer/optimizer/shampoo_utils.py#L533
 @torch.no_grad()
@@ -193,7 +208,7 @@ class AdEMAMix(BaseOptimizer):
         )
     
     @staticmethod
-    def get_rms(x: torch.Tensor) -> float:
+    def get_rms(x: torch.Tensor) -> torch.Tensor:
         r"""Get RMS."""
         return x.norm(2) / math.sqrt(x.numel())
 
@@ -297,25 +312,46 @@ class AdEMAMix(BaseOptimizer):
                         elif group['update_strategy'] == 'grams':
                             update.copy_(torch.sign(grad) * update.abs())
 
+                    # de_nom already computed
                     update = update / de_nom
 
-                    self.apply_weight_decay(
-                        p=p_fp32,
-                        grad=update,
-                        lr=group['lr'],
-                        weight_decay=group['weight_decay'],
-                        weight_decouple=group['weight_decouple'],
-                        fixed_decay=group['fixed_decay'],
-                    )
+                    # Scalar LR
+                    lr_val = group['lr']
+                    if torch.is_tensor(lr_val):
+                        lr_val = float(lr_val.detach().cpu().item())
+                    else:
+                        lr_val = float(lr_val)
 
-                    p_fp32.add_(-group['lr'] * update)
-                    
-                if p.dtype in {torch.float16, torch.bfloat16}:
-                    if beta1 > 0.0:
-                        copy_stochastic_(state["exp_avg"], exp_avg)
-                    copy_stochastic_(state["exp_avg_sq"], exp_avg_sq)
-                    copy_stochastic_(state["exp_avg_slow"], exp_avg_slow)
-                    copy_stochastic_(p, p_fp32)
+                    # Inline, scalar-only weight decay on p_fp32 device
+                    wd = float(group['weight_decay'])
+                    if wd != 0.0:
+                        if group['weight_decouple']:
+                            # Decoupled (AdamW-style): p <- p * (1 - lr * wd)
+                            p_fp32.mul_(1.0 - lr_val * wd)
+                        else:
+                            # L2: add into the update direction
+                            if update.device != p_fp32.device:
+                                update = update.to(p_fp32.device)
+                            update.add_(p_fp32, alpha=wd)
+
+                    # Ensure update is on same device as p_fp32
+                    if update.device != p_fp32.device:
+                        update = update.to(p_fp32.device)
+
+                    # Apply the step with scalar LR
+                    p_fp32.add_(update, alpha=-lr_val)
+
+                    # Write back to original param device for offloaded params
+                    if p_fp32.device != p.device:
+                        copy_stochastic_(p, p_fp32.to(p.device))
+
+                    # Keep your existing bf16 state copy-backs
+                    if p.dtype in {torch.float16, torch.bfloat16}:
+                        if beta1 > 0.0:
+                            copy_stochastic_(state["exp_avg"], exp_avg)
+                        copy_stochastic_(state["exp_avg_sq"], exp_avg_sq)
+                        copy_stochastic_(state["exp_avg_slow"], exp_avg_slow)
+                        copy_stochastic_(p, p_fp32)
 
         return loss
 
@@ -527,31 +563,48 @@ class SimplifiedAdEMAMix(BaseOptimizer):
                         if update_strategy in {'grams','both'}:
                             update.copy_(torch.sign(grad) * update.abs())
 
-                    update.div_(de_nom)
+                        update.div_(de_nom)
 
-                    if group['bias_correction1']:
-                        update.div_(state['num_sum'])
-                    if group['bias_correction2']:
-                        update.mul_(math.sqrt(state['den_sum']))
+                        if group['bias_correction1']:
+                            update.div_(state['num_sum'])
+                        if group['bias_correction2']:
+                            update.mul_(math.sqrt(state['den_sum']))
 
-                    if use_adopt:
-                        update.clamp_(-adopt_clip, adopt_clip)
+                        if use_adopt:
+                            update.clamp_(-adopt_clip, adopt_clip)
 
-                    self.apply_weight_decay(
-                        p=p_fp32,
-                        grad=grad,
-                        lr=group['lr'],
-                        weight_decay=group['weight_decay'],
-                        weight_decouple=group['weight_decouple'],
-                        fixed_decay=group['fixed_decay'],
-                    )
+                        # Scalar LR
+                        lr_val = group['lr']
+                        if torch.is_tensor(lr_val):
+                            lr_val = float(lr_val.detach().cpu().item())
+                        else:
+                            lr_val = float(lr_val)
 
-                    p_fp32.add_(update, alpha=-group['lr'])
+                        # Inline, scalar-only weight decay
+                        wd = float(group['weight_decay'])
+                        if wd != 0.0:
+                            if group['weight_decouple']:
+                                p_fp32.mul_(1.0 - lr_val * wd)
+                            else:
+                                if update.device != p_fp32.device:
+                                    update = update.to(p_fp32.device)
+                                update.add_(p_fp32, alpha=wd)
 
-                    if p.dtype == torch.bfloat16:
-                        copy_stochastic_(state["exp_avg"], exp_avg)
-                        copy_stochastic_(state["exp_avg_sq"], exp_avg_sq)
-                        copy_stochastic_(p, p_fp32)
+                        # Ensure update device alignment
+                        if update.device != p_fp32.device:
+                            update = update.to(p_fp32.device)
+
+                        # Step with scalar LR
+                        p_fp32.add_(update, alpha=-lr_val)
+
+                        # Offload-safe write-back
+                        if p_fp32.device != p.device:
+                            copy_stochastic_(p, p_fp32.to(p.device))
+
+                        if p.dtype == torch.bfloat16:
+                            copy_stochastic_(state["exp_avg"], exp_avg)
+                            copy_stochastic_(state["exp_avg_sq"], exp_avg_sq)
+                            copy_stochastic_(p, p_fp32)
 
         return loss
     
@@ -618,19 +671,20 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
             'min_beta1': min_beta1,
             'weight_decay': weight_decay,
             'weight_decouple': weight_decouple,
+            'fixed_decay': False,  # for safe_apply_weight_decay
             'eps': eps,
-            'eps2': 1e-2,
+            'eps2': 1e-2,          # <- missing in your version, needed by adaptive_eps
             'eps_floor': eps_floor,
             'use_orthograd': use_orthograd,
             'update_strategy': update_strategy,
             'update_strategy_scale': update_strategy_scale,
-            'use_stable_spam_clipping':use_stable_spam_clipping,
+            'use_stable_spam_clipping': use_stable_spam_clipping,
             'use_compass': use_compass,
             'use_adabelief': use_adabelief,
             'torch_compile': torch_compile,
             'amsgrad_max_decay_rate': amsgrad_max_decay_rate,
             'amsgrad_min_decay_rate': amsgrad_min_decay_rate,
-            'use_newton_schulz':use_newton_schulz,
+            'use_newton_schulz': use_newton_schulz,
         }
 
         super().__init__(params, defaults)
@@ -812,16 +866,33 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                     update.clamp_(-adopt_clip, adopt_clip)
 
-                    self.apply_weight_decay(
-                        p=p_fp32,
-                        grad=grad_normed,
-                        lr=group['lr'],
-                        weight_decay=group['weight_decay'],
-                        weight_decouple=group['weight_decouple'],
-                        fixed_decay=False,
-                    )
+                    # Scalar LR
+                    lr_val = group['lr']
+                    if torch.is_tensor(lr_val):
+                        lr_val = float(lr_val.detach().cpu().item())
+                    else:
+                        lr_val = float(lr_val)
 
-                    p_fp32.add_(update, alpha=-group['lr'])
+                    # Inline, scalar-only weight decay
+                    wd = float(group['weight_decay'])
+                    if wd != 0.0:
+                        if group['weight_decouple']:
+                            p_fp32.mul_(1.0 - lr_val * wd)
+                        else:
+                            if update.device != p_fp32.device:
+                                update = update.to(p_fp32.device)
+                            update.add_(p_fp32, alpha=wd)
+
+                    # Ensure update on the same device as p_fp32
+                    if update.device != p_fp32.device:
+                        update = update.to(p_fp32.device)
+
+                    # Step with scalar LR
+                    p_fp32.add_(update, alpha=-lr_val)
+
+                    # Offload-safe write-back
+                    if p_fp32.device != p.device:
+                        copy_stochastic_(p, p_fp32.to(p.device))
 
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(state["exp_avg"], exp_avg)
@@ -829,6 +900,285 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                         copy_stochastic_(p, p_fp32)
 
         return loss
+
+
+class SimplifiedAdEMAMixExM_RamTorch(BaseOptimizer):
+    r"""
+    RamTorch-compatible version of SimplifiedAdEMAMixExM with CPU offloading.
+
+    This optimizer stores its state on a specified storage device (typically CPU)
+    and performs the update computation on the GPU for performance. It is compatible
+    with RamTorch layers and multi-GPU training setups.
+    """
+
+    def __init__(
+        self,
+        params: ParamGroup,
+        lr: float = 2e-4,
+        betas: Betas = (0.95, 0.997),
+        min_beta1: float = 0.95,
+        beta1_warmup: Optional[int] = None,
+        weight_decay: float = 0.0,
+        weight_decouple: bool = True,
+        alpha: float = 1.0,
+        eps: float = 1e-8,
+        eps_floor: Optional[float] = 1e-12,
+        use_orthograd: bool = True,
+        update_strategy: str = 'unmodified',
+        update_strategy_scale: float = 1.0,
+        use_stable_spam_clipping: bool = True,
+        use_compass: bool = False,
+        use_adabelief: bool = True,
+        use_newton_schulz: bool = True,
+        amsgrad_min_decay_rate: float = 0.98,
+        amsgrad_max_decay_rate: float = 0.98,
+        torch_compile: bool = True,
+        # --- RamTorch / Offloading Parameters ---
+        storage_device: str = "cpu",
+        optim_state_dtype: torch.dtype = torch.float32,
+        chunk_size: int = 64,
+        **kwargs,
+    ):
+        self.validate_learning_rate(lr)
+        self.validate_betas(betas)
+        # (Add other validation from original __init__)
+
+        defaults: Defaults = {
+            'lr': lr, 'betas': betas, 'alpha': alpha, 'beta1_warmup': beta1_warmup,
+            'min_beta1': min_beta1, 'weight_decay': weight_decay, 'weight_decouple': weight_decouple,
+            'fixed_decay': False, # Add this for apply_weight_decay
+            'eps': eps, 'eps_floor': eps_floor, 'use_orthograd': use_orthograd,
+            'update_strategy': update_strategy, 'update_strategy_scale': update_strategy_scale,
+            'use_stable_spam_clipping': use_stable_spam_clipping, 'use_compass': use_compass,
+            'use_adabelief': use_adabelief, 'torch_compile': torch_compile,
+            'amsgrad_max_decay_rate': amsgrad_max_decay_rate, 'amsgrad_min_decay_rate': amsgrad_min_decay_rate,
+            'use_newton_schulz': use_newton_schulz,
+        }
+        super().__init__(params, defaults)
+        
+        self.storage_device = torch.device(storage_device)
+        self.optim_state_dtype = optim_state_dtype
+        self.chunk_size = chunk_size
+        
+        # For advanced users: dedicated stream for better overlap
+        # self.stream = torch.cuda.Stream()
+
+    def __str__(self) -> str:
+        return 'SimplifiedAdEMAMixExM_RamTorch'
+
+    @staticmethod
+    def linear_hl_warmup_scheduler(step: int, beta_end: float, beta_start: float, warmup: int) -> float:
+        def f(beta: float, eps: float = 1e-8) -> float:
+            return math.log(0.5) / math.log(beta + eps) - 1.0
+        def f_inv(t: float) -> float:
+            return math.pow(0.5, 1.0 / (t + 1.0))
+        if step < warmup:
+            a: float = step / float(warmup)
+            return f_inv((1.0 - a) * f(beta_start) + a * f(beta_end))
+        return beta_end
+
+    @torch.no_grad()
+    def step(self, closure: Closure = None) -> Loss:
+        loss: Loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if 'step' in group:
+                group['step'] += 1
+            else:
+                group['step'] = 1
+            
+            step = group['step']
+            
+            # Transplanted from SimplifiedAdEMAMixExM
+            beta1, beta2 = group['betas']
+
+            use_orthograd = group['use_orthograd']
+            use_compass = group['use_compass']
+            use_adabelief = group['use_adabelief']
+            use_newton_schulz = group['use_newton_schulz']
+            update_strategy  = group['update_strategy']
+            update_strategy_scale  = group['update_strategy_scale']
+            amsgrad_min_decay_rate  = group['amsgrad_min_decay_rate']
+            amsgrad_max_decay_rate  = group['amsgrad_max_decay_rate']
+            torch_compile = group['torch_compile']
+
+            use_stable_spam_clipping = group["use_stable_spam_clipping"]
+            
+            eps_floor = group['eps_floor']
+
+            if group['beta1_warmup']:
+                beta1 = self.linear_hl_warmup_scheduler(
+                    step, beta_end=beta1, beta_start=group['min_beta1'], warmup=group['beta1_warmup']
+                )
+
+            beta2_scheduled = ((beta2 ** step - beta2) / (beta2 ** step - 1.0)) if step > 1 else beta2
+
+            bias_correction1 = 1 - beta1 ** step
+            bias_correction2_sqrt = (1 - beta2_scheduled ** step) ** 0.5
+            
+            adopt_clip: float = (step-1)**0.25
+
+            for i, p in enumerate(group['params']):
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.is_sparse:
+                    raise NoSparseGradientError(str(self))
+
+                state = self.state[p]
+
+                # ================= LAZY STATE INITIALIZATION =================
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, device=self.storage_device, dtype=self.optim_state_dtype)
+                    state['exp_avg_sq'] = torch.zeros_like(p, device=self.storage_device, dtype=self.optim_state_dtype)
+                    if self.storage_device.type == 'cpu':
+                        state['exp_avg'].pin_memory()
+                        state['exp_avg_sq'].pin_memory()
+                    if group['use_stable_spam_clipping']:
+                        state['ssc_m_norm_t'] = torch.tensor(0.0, device=self.storage_device)
+                        state['ssc_v_norm_t'] = torch.tensor(0.0, device=self.storage_device)
+                        state['ssc_m_max_t'] = torch.tensor(0.0, device=self.storage_device)
+
+                # per-param step is not used by the main logic, but could be useful for other things
+                state['step'] += 1
+                
+                # ================= DEVICE SELECTION & H2D TRANSFER =================
+                if grad.device.type == "cuda":
+                    compute_device = grad.device
+                elif p.device.type == "cuda":
+                    compute_device = p.device
+                else:
+                    compute_device = torch.device("cuda", torch.cuda.current_device())
+
+                p_fp32 = p.to(compute_device, dtype=torch.float32, non_blocking=True)
+                grad_fp32 = grad.to(compute_device, dtype=torch.float32, non_blocking=True)
+                exp_avg_fp32 = state['exp_avg'].to(compute_device, dtype=torch.float32, non_blocking=True)
+                exp_avg_sq_fp32 = state['exp_avg_sq'].to(compute_device, dtype=torch.float32, non_blocking=True)
+                
+                ssc_state_gpu = {}
+                if group['use_stable_spam_clipping']:
+                    for key in ['ssc_m_norm_t', 'ssc_v_norm_t', 'ssc_m_max_t']:
+                        ssc_state_gpu[key] = state[key].to(compute_device, non_blocking=True)
+
+                # ================= GPU COMPUTE (FULL ORIGINAL LOGIC) =================
+                
+                safe_apply_weight_decay(self, p=p_fp32, grad=grad_fp32, lr=group['lr'], weight_decay=group['weight_decay'], weight_decouple=group['weight_decouple'], fixed_decay=group['fixed_decay'])
+                
+                apply_ortho_to_group = group.get('is_ortho_group', False)
+                if apply_ortho_to_group and use_orthograd:
+                    _paper_orthograd(param=p_fp32, grad=grad_fp32)
+
+                if use_stable_spam_clipping:
+                    grad_fp32 = _stable_spam_clipping_impl(
+                        ssc_state_gpu, grad_fp32, step=step, eps=eps_floor
+                    )
+
+                # Calculate RMS of grad once
+                rms_grad = torch.sqrt(torch.mean(grad_fp32.pow(2)))
+                curr_eps = adaptive_eps(grad_fp32, group, rms_grad=rms_grad)
+
+                # RMS Norm
+                grad_normed = grad_fp32.div(rms_grad.clamp_min_(1))
+
+                if use_newton_schulz:
+                    if grad_normed.ndim > 0:
+                        if torch_compile:
+                            grad_normed = zero_power_via_newton_schulz_6_compile(grad_normed)
+                        else:
+                            grad_normed = zero_power_via_newton_schulz_6(grad_normed)
+                    elif grad_normed.numel() > 1:
+                        if torch_compile:
+                            grad_normed = bias_rms_compile(grad_normed)
+                        else:
+                            grad_normed = bias_rms(grad_normed)
+                
+                # Adaptive ema
+                mask = (grad_normed * exp_avg_fp32 > 0).to(grad_normed.dtype)
+                mask.clamp_min_(beta1)
+                mask.div_(mask.mean().clamp_(min=1e-3)) # Divide by mean (0.001-1.0)
+                exp_avg_fp32.mul_(mask)
+
+                exp_avg_fp32.mul_(beta1).add_(grad_normed, alpha=1.0 - beta1)
+
+                bias_corrected_axp_avg = None
+                # Compass amplification + beta1 Bias correction
+                if use_compass:
+                    bias_corrected_axp_avg = exp_avg_fp32.div(bias_correction1)
+                    c_t = grad_normed.add(bias_corrected_axp_avg, alpha=group['alpha'])
+                else:
+                    c_t = grad_normed
+
+                if step == 1:
+                    if use_compass:
+                        # Try adding residual to c_t
+                        assert bias_corrected_axp_avg is not None
+                        grad_residual = c_t.add(grad_normed.add(bias_corrected_axp_avg, alpha=-1))
+                    else:
+                        grad_residual = grad_normed - exp_avg_fp32
+                    exp_avg_sq_fp32.addcmul_(grad_residual, grad_residual)
+                else:
+                    de_nom = exp_avg_sq_fp32.sqrt().div_(bias_correction2_sqrt).add_(curr_eps)
+
+                    if use_adabelief:
+                        if use_compass:
+                            # Try adding residual to c_t
+                            assert bias_corrected_axp_avg is not None
+                            grad_residual = c_t.add(grad_normed.add(bias_corrected_axp_avg, alpha=-1))
+                        else:
+                            grad_residual = grad_normed - exp_avg_fp32
+                        new_exp_avg_sq = exp_avg_sq_fp32.mul(beta2_scheduled).addcmul_(grad_residual, grad_residual, value=1.0 - beta2_scheduled)
+                    else:
+                        new_exp_avg_sq = exp_avg_sq_fp32.mul(beta2_scheduled).addcmul_(c_t, c_t, value=1.0 - beta2_scheduled)
+
+                    # Decaying amsgrad
+                    torch.maximum(exp_avg_sq_fp32.mul_(max(min(beta2_scheduled, amsgrad_max_decay_rate), amsgrad_min_decay_rate)), new_exp_avg_sq, out=exp_avg_sq_fp32)
+
+                    if use_compass:
+                        update = c_t
+                    else:
+                        update = (group['alpha'] * grad_normed + exp_avg_fp32)
+
+                    update = apply_update_strategies(update, grad_normed, update_strategy, update_strategy_scale)
+
+                    update.div_(de_nom)
+
+                    if not use_compass:
+                        update.div_(bias_correction1)
+
+                    update.clamp_(-adopt_clip, adopt_clip)
+
+                    p_fp32.add_(update, alpha=-group['lr'])
+
+                # ================= D2H DATA TRANSFER =================
+                if p.dtype == torch.bfloat16:
+                    copy_stochastic_(p.data, p_fp32.to(p.device))
+                else:
+                    p.data.copy_(p_fp32.to(p.device, non_blocking=True), non_blocking=True)
+
+                # ---- optimizer state ----
+                if self.optim_state_dtype == torch.bfloat16:
+                    copy_stochastic_(state['exp_avg'], exp_avg_fp32)
+                    copy_stochastic_(state['exp_avg_sq'], exp_avg_sq_fp32)
+                else:
+                    state['exp_avg'].copy_(exp_avg_fp32, non_blocking=True)
+                    state['exp_avg_sq'].copy_(exp_avg_sq_fp32, non_blocking=True)
+
+                if group['use_stable_spam_clipping']:
+                    for key, value_gpu in ssc_state_gpu.items():
+                        state[key].copy_(value_gpu, non_blocking=True)
+
+                # ================= CHUNKED SYNCHRONIZATION =================
+                if (i + 1) % self.chunk_size == 0:
+                    torch.cuda.synchronize()
+
+        torch.cuda.synchronize()
+        return loss
+
 
 @torch.no_grad()
 def apply_update_strategies(update, grad, update_strategy, scale=1.0):

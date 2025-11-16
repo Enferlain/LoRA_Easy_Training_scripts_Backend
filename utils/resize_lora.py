@@ -6,7 +6,7 @@
 import os
 from pathlib import Path
 
-os.chdir("sd_scripts")
+# os.chdir("sd_scripts")
 
 import argparse
 import torch
@@ -14,8 +14,9 @@ from safetensors.torch import load_file, save_file, safe_open
 from tqdm import tqdm
 import numpy as np
 
-from library import train_util, model_util
-from library.utils import setup_logging
+from library.train import train_util
+from library.models import model_util
+from library.utils.common_utils import setup_logging
 
 setup_logging()
 import logging  # noqa: E402

@@ -168,7 +168,7 @@ async def start_training(request: Request) -> JSONResponse:
     app.state.TRAINING_THREAD = subprocess.Popen(
         [
             f"{python}",
-            f"{Path(f'sd_scripts/{app.state.TRAIN_SCRIPT}').resolve()}",
+            f"{Path(f'sd_scripts/training/{app.state.TRAIN_SCRIPT}').resolve()}",
             f"--config_file={config.resolve()}",
             f"--dataset_config={dataset.resolve()}",
         ]
