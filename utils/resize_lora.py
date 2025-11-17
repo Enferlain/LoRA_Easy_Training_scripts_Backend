@@ -4,23 +4,22 @@
 
 # Modified from kohya's resize script to allow removing of conv or linear dims
 import os
+import logging  # noqa: E402
+import argparse
+import torch
+import numpy as np
+
 from pathlib import Path
+from safetensors.torch import load_file, save_file, safe_open
+from tqdm import tqdm
 
 # os.chdir("sd_scripts")
 
-import argparse
-import torch
-from safetensors.torch import load_file, save_file, safe_open
-from tqdm import tqdm
-import numpy as np
-
-from library.train import train_util
 from library.models import model_util
 from library.utils.common_utils import setup_logging
+from library.train.checkpointing import precalculate_safetensors_hashes
 
 setup_logging()
-import logging  # noqa: E402
-
 logger = logging.getLogger(__name__)
 
 MIN_SV = 1e-6
@@ -432,7 +431,7 @@ def resize(args):
         metadata["ss_network_dim"] = "Dynamic"
         metadata["ss_network_alpha"] = "Dynamic"
 
-    model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(
+    model_hash, legacy_hash = precalculate_safetensors_hashes(
         state_dict, metadata
     )
     metadata["sshs_model_hash"] = model_hash

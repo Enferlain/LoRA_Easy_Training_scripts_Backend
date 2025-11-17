@@ -1,7 +1,7 @@
 from pathlib import Path
 import json
 
-from library.train.train_util import BucketManager
+from library.train.data_structures import BucketManager
 from PIL import Image
 import math
 from LoraEasyCustomOptimizer import OPTIMIZERS
