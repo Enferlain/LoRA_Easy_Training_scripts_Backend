@@ -6,7 +6,7 @@ from PIL import Image
 
 from LoraEasyCustomOptimizer import OPTIMIZERS
 
-from library.train.data_structures import BucketManager
+from library.data.data_structures import BucketManager
 
 
 def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict, dict]:
